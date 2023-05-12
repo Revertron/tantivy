@@ -55,10 +55,12 @@ impl FragmentCandidate {
 pub struct Snippet {
     fragment: String,
     highlighted: Vec<Range<usize>>,
+    before: String,
+    after: String,
 }
 
-const HIGHLIGHTEN_PREFIX: &str = "<b>";
-const HIGHLIGHTEN_POSTFIX: &str = "</b>";
+const HIGHLIGHTEN_PREFIX: &str = "<em>";
+const HIGHLIGHTEN_POSTFIX: &str = "</em>";
 
 impl Snippet {
     /// Create a new, empty, `Snippet`
@@ -66,6 +68,8 @@ impl Snippet {
         Snippet {
             fragment: String::new(),
             highlighted: Vec::new(),
+            before: String::new(),
+            after: String::new(),
         }
     }
 
@@ -78,6 +82,7 @@ impl Snippet {
     pub fn to_html(&self) -> String {
         let mut html = String::new();
         let mut start_from: usize = 0;
+        html.push_str(&self.before);
 
         for item in collapse_overlapped_ranges(&self.highlighted) {
             html.push_str(&encode_minimal(&self.fragment[start_from..item.start]));
@@ -86,9 +91,8 @@ impl Snippet {
             html.push_str(HIGHLIGHTEN_POSTFIX);
             start_from = item.end;
         }
-        html.push_str(&encode_minimal(
-            &self.fragment[start_from..self.fragment.len()],
-        ));
+        html.push_str(&encode_minimal(&self.fragment[start_from..self.fragment.len()].trim_end()));
+        html.push_str(&self.after);
         html
     }
 
@@ -133,20 +137,126 @@ fn search_fragments<'a>(
     let mut token_stream = tokenizer.token_stream(text);
     let mut fragment = FragmentCandidate::new(0);
     let mut fragments: Vec<FragmentCandidate> = vec![];
-    while let Some(next) = token_stream.next() {
-        if (next.offset_to - fragment.start_offset) > max_num_chars {
+    while let Some(token) = token_stream.next() {
+        if (token.offset_to - fragment.start_offset) > max_num_chars {
             if fragment.score > 0.0 {
                 fragments.push(fragment)
             };
-            fragment = FragmentCandidate::new(next.offset_from);
+            fragment = FragmentCandidate::new(token.offset_from);
         }
-        fragment.try_add_token(next, terms);
+        fragment.try_add_token(token, terms);
     }
     if fragment.score > 0.0 {
         fragments.push(fragment)
     }
 
     fragments
+}
+
+fn search_fragments_fast(text: &str, terms: &BTreeMap<String, Score>, max_num_chars: usize) -> Vec<FragmentCandidate> {
+    let mut tokens = Vec::new();
+    let mut new_terms = terms.clone();
+    for (term, score) in terms.iter() {
+        if term.chars().count() >= 2 {
+            new_terms.insert(capitalize(term), *score);
+        }
+    }
+    let terms = new_terms;
+
+    for (term, _score) in terms.iter() {
+        if term.chars().count() < 2 {
+            continue;
+        }
+        for (start, word) in text.match_indices(term) {
+            let mut end = start;
+            for b in &text.as_bytes()[start..] {
+                if *b < 65 {
+                    break;
+                }
+                end += 1;
+            }
+            tokens.push((start, end, word));
+        }
+    }
+    let chars_count = text.chars().count();
+    if tokens.is_empty() {
+        let mut fragment = FragmentCandidate::new(0);
+        if chars_count <= max_num_chars {
+            fragment.stop_offset = text.len();
+        } else {
+            let (pos, _) = text.char_indices().skip(max_num_chars - 1).next().unwrap();
+            fragment.stop_offset = pos;
+        }
+        return vec![fragment];
+    }
+    tokens.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut fragment = FragmentCandidate::new(0);
+    let mut fragments = Vec::new();
+    let mut highlight_start = 0;
+    for (token_start, token_end, word) in tokens.iter() {
+        let half = (max_num_chars - word.len()) / 2;
+        let mut start = if half > *token_start { 0 } else { token_start - half };
+        if start > 0 {
+            for b in &text.as_bytes()[start..*token_start] {
+                start += 1;
+                if *b == 32 || *b == 13 {
+                    break;
+                }
+            }
+        }
+        let mut end = if *token_end + half > text.len() { text.len() } else { token_end + half };
+        for b in text.as_bytes()[*token_end..end].iter().rev() {
+            if *b == 32 || *b == 13 || end == *token_end {
+                break;
+            }
+            end -= 1;
+        }
+        if chars_count <= max_num_chars {
+            end = text.len();
+        }
+
+        let chars = text[fragment.start_offset..*token_end].chars().count();
+        if chars > max_num_chars {
+            if fragment.score > 0.0 {
+                fragments.push(fragment)
+            };
+            fragment = FragmentCandidate::new(start);
+            highlight_start = *token_start;
+        } else if fragment.start_offset == 0 {
+            fragment.start_offset = highlight_start;
+        }
+        fragment.stop_offset = end;
+
+        if let Some(&score) = terms.get(&word.to_lowercase()) {
+            fragment.score += score;
+            fragment.highlighted.push(*token_start..*token_end);
+            highlight_start = *token_start.min(&highlight_start);
+        } else if let Some(&score) = terms.get(*word) {
+            fragment.score += score;
+            fragment.highlighted.push(*token_start..*token_end);
+            highlight_start = *token_start.min(&highlight_start);
+        }
+    }
+    if fragment.score > 0.0 {
+        fragments.push(fragment)
+    }
+
+    fragments
+}
+
+fn capitalize(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let first_char = text.chars().next().unwrap();
+    let mut result = String::with_capacity(text.len());
+    result.push_str(&first_char.to_uppercase().to_string());
+    text
+        .chars()
+        .skip(1)
+        .for_each(|ch| result.push(ch));
+    result
 }
 
 /// Returns a Snippet
@@ -172,9 +282,21 @@ fn select_best_fragment_combination(fragments: &[FragmentCandidate], text: &str)
             .iter()
             .map(|item| item.start - fragment.start_offset..item.end - fragment.start_offset)
             .collect();
+        let before = if fragment.start_offset > 0 {
+            "…".to_owned()
+        } else {
+            "".to_owned()
+        };
+        let after = if fragment.stop_offset < text.len() - 1 {
+            "…".to_owned()
+        } else {
+            "".to_owned()
+        };
         Snippet {
             fragment: fragment_text.to_string(),
             highlighted,
+            before,
+            after
         }
     } else {
         // when there no fragments to chose from,
@@ -182,6 +304,8 @@ fn select_best_fragment_combination(fragments: &[FragmentCandidate], text: &str)
         Snippet {
             fragment: String::new(),
             highlighted: vec![],
+            before: String::new(),
+            after: String::new(),
         }
     }
 }
@@ -355,8 +479,7 @@ impl SnippetGenerator {
 
     /// Generates a snippet for the given text.
     pub fn snippet(&self, text: &str) -> Snippet {
-        let fragment_candidates =
-            search_fragments(&self.tokenizer, text, &self.terms_text, self.max_num_chars);
+        let fragment_candidates = search_fragments_fast(text, &self.terms_text, self.max_num_chars);
         select_best_fragment_combination(&fragment_candidates[..], text)
     }
 }
